@@ -106,6 +106,41 @@ python npu_service.py --port 8192 --device NPU
 - If no NPU is detected, the service automatically switches to CPU and reports this in `/health`.
 - Models are lazily loaded on first request, so the first call to each endpoint has a small warmup delay.
 
+### Using NPU from other BSAI plugins
+
+Any BSAI plugin can use the NPU service by importing the shared client (`bsai_npu_client.py`, placed in the ComfyUI root directory):
+
+```python
+from bsai_npu_client import npu, npu_available, npu_status
+
+# Check availability
+if npu_available():
+    # Detect faces on a BGR numpy image
+    faces = npu.detect_faces(image_bgr)
+
+    for face in faces:
+        bbox = face["bbox"]  # [x1, y1, x2, y2]
+
+        # 106-point landmarks
+        landmarks = npu.landmark_106(image_bgr, bbox)
+
+        # Gender & age
+        ga = npu.gender_age(image_bgr, bbox)
+        print(f"Gender: {ga['gender']}, Age: {ga['age']}")
+
+        # 512-dim face embedding
+        embedding = npu.recognize(image_bgr, bbox)
+
+    # One-shot: detect + landmarks + gender/age for all faces
+    results = npu.analyze(image_bgr)
+```
+
+The client automatically:
+- Uses in-process direct calls when NPU-Service is loaded as a ComfyUI plugin (zero HTTP overhead)
+- Falls back to HTTP when running standalone
+- Auto-starts the NPU service if not running
+- Degrades gracefully to CPU when no NPU hardware is present
+
 ---
 
 ## 中文
@@ -209,6 +244,41 @@ python npu_service.py --port 8192 --device NPU
 - `face-recog-r50` 因 NPU 后端算子输出 NaN 的已知问题，强制走 CPU 推理。
 - 未检测到 NPU 时，服务自动切换 CPU，并在 `/health` 中如实上报实际设备。
 - 模型采用懒加载策略，首次调用每个接口时有少量编译预热延迟。
+
+### 其他 BSAI 插件如何调用 NPU
+
+任何 BSAI 插件通过共享客户端（`bsai_npu_client.py`，位于 ComfyUI 根目录）即可使用 NPU 能力：
+
+```python
+from bsai_npu_client import npu, npu_available, npu_status
+
+# 检查 NPU 是否可用
+if npu_available():
+    # 在 BGR numpy 图像上检测人脸
+    faces = npu.detect_faces(image_bgr)
+
+    for face in faces:
+        bbox = face["bbox"]  # [x1, y1, x2, y2]
+
+        # 106 点关键点
+        landmarks = npu.landmark_106(image_bgr, bbox)
+
+        # 性别年龄
+        ga = npu.gender_age(image_bgr, bbox)
+        print(f"性别: {ga['gender']}, 年龄: {ga['age']}")
+
+        # 512 维人脸特征向量
+        embedding = npu.recognize(image_bgr, bbox)
+
+    # 一键全流程：检测 + 关键点 + 性别年龄
+    results = npu.analyze(image_bgr)
+```
+
+客户端自动处理：
+- NPU 服务已作为 ComfyUI 插件加载时走同进程直连（零 HTTP 开销）
+- 独立运行时自动回退 HTTP
+- 服务未启动时自动拉起子进程
+- 无 NPU 硬件时自动降级 CPU
 
 ---
 
