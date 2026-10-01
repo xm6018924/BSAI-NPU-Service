@@ -9,12 +9,14 @@ BSAI NPU Service —— ComfyUI 插件入口
 - POST /recog_r50     -> 512 维人脸特征向量
 - POST /gender_age    -> 性别年龄
 
-FaceRefine 会请求 http://127.0.0.1:8191/health 判断 NPU 服务是否在线；
-本插件加载后该请求直接命中，FaceRefine 的自动拉起逻辑不会触发（无端口冲突）。
+任何 BSAI 插件自动获得 NPU 能力（无需手动 import）：
+    from bsai_npu_client import npu, npu_available
 """
 
 import json
 import os
+import sys
+import threading
 
 import aiohttp
 from aiohttp import web
@@ -29,6 +31,45 @@ NODE_DISPLAY_NAME_MAPPINGS = {}
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
 
 _svc = NPUService()
+
+
+# ---------------- 全局注入：让任何 BSAI 插件直接 import bsai_npu_client ----------------
+def _inject_client():
+    """把客户端模块注入 sys.modules，其他插件 from bsai_npu_client import npu 即可用"""
+    client_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bsai_npu_client.py")
+    if not os.path.exists(client_src):
+        return
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("bsai_npu_client", client_src)
+        mod = importlib.util.module_from_spec(spec)
+        # 让客户端直接引用本插件的 _svc（同进程零开销）
+        mod._svc = _svc
+        mod._direct = True
+        sys.modules["bsai_npu_client"] = mod
+        spec.loader.exec_module(mod)
+        # exec_module 会重置 _svc，重新绑定
+        mod._svc = _svc
+        mod._direct = True
+    except Exception as e:
+        print("[BSAI-NPU-Service] 客户端注入跳过: %s" % e)
+
+
+_inject_client()
+
+
+# ---------------- 后台预热 NPU 模型 ----------------
+def _warmup():
+    try:
+        import numpy as np
+        dummy = np.zeros((64, 64, 3), dtype=np.uint8)
+        _svc.detect_faces(dummy)
+        print("[BSAI-NPU-Service] NPU 模型预热完成 (device=%s)" % _svc.device)
+    except Exception as e:
+        print("[BSAI-NPU-Service] NPU 预热跳过: %s" % e)
+
+
+threading.Thread(target=_warmup, daemon=True).start()
 
 
 # ---------------- 路由处理 ----------------
