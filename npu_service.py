@@ -18,6 +18,7 @@ import base64
 import json
 import math
 import os
+import threading
 import time
 from collections import namedtuple
 
@@ -65,31 +66,60 @@ def _available_devices(core):
         return []
 
 
-def _has_npu(core):
-    return "NPU" in _available_devices(core)
+def _has_device(core, name):
+    return name in _available_devices(core)
 
 
 class NPUService:
-    """NPU 推理服务（懒加载模型，线程安全：同一 compiled model 并发推理由 OpenVINO 保证）"""
+    """NPU 推理服务（懒加载模型，线程安全：同一 compiled model 并发推理由 OpenVINO 保证）
 
-    # NPU 上输出异常、固定走 CPU 的模型（face-recog-r50 在 NPU 全 nan，NPU 后端算子问题）
-    _CPU_MODELS = {"face-recog-r50": "CPU"}
+    设备降级链：NPU → GPU（Intel 核显/XPU）→ CPU
+    - NPU 最快最低功耗
+    - GPU（核显）比 CPU 快 5-10 倍，OpenVINO 对 SCRFD/R50 算子支持完整
+    - CPU 兜底，保证服务不中断
+    """
+
+    # 优先级：首选 NPU，其次 GPU（核显），最后 CPU
+    DEVICE_PRIORITY = ["NPU", "GPU", "CPU"]
 
     def __init__(self, device="NPU", models_root=MODELS_ROOT):
+        self.requested_device = device
         self.device = device
         self.models_root = models_root
         self._core = None
         self._compiled = {}
         self._lazy_lock = None  # 由 aiohttp 事件循环外调用，无并发竞争；保留字段兼容
+        self._inflight = 0        # 当前在途推理数（队列深度）
+        self._total_calls = 0     # 累计推理调用数
+        self._inflight_lock = threading.Lock()
 
     # ---------------- 基础设施 ----------------
     @property
     def core(self):
         if self._core is None:
             c = _core()
-            if self.device == "NPU" and not _has_npu(c):
-                # NPU 不可用时降级 CPU，保证服务可用（/health 会如实上报实际设备）
-                self.device = "CPU"
+            # 按优先级选择第一个可用设备：NPU → GPU → CPU
+            avail = _available_devices(c)
+            chosen = "CPU"  # CPU 永远可用
+            for d in self.DEVICE_PRIORITY:
+                if d == "CPU":
+                    break
+                if d in avail:
+                    chosen = d
+                    break
+            # 如果用户显式指定了 GPU 或 CPU（命令行 --device），尊重用户选择
+            if self.requested_device in ("GPU", "CPU") and self.requested_device in avail:
+                chosen = self.requested_device
+            self.device = chosen
+            print("[BSAI-NPU-Service] device selected: %s (available: %s)" % (chosen, avail))
+            # 持久化 OpenVINO 编译缓存：首次编译后写入 models/NPU/.cache，
+            # 后续启动跳过 NPU 重编译，缩短预热到秒级
+            try:
+                cache_dir = os.path.join(self.models_root, ".cache")
+                os.makedirs(cache_dir, exist_ok=True)
+                c.set_property(self.device, "CACHE_DIR", cache_dir)
+            except Exception:
+                pass
             self._core = c
         return self._core
 
@@ -97,16 +127,34 @@ class NPUService:
         return os.path.join(self.models_root, name, "openvino_model.xml")
 
     def get_compiled(self, name, device=None):
-        """懒加载 + 编译缓存；部分模型在 NPU 上输出异常（如 face-recog-r50 全 nan），
-        固定走 CPU（见 _CPU_MODELS）"""
-        dev = device or (self._CPU_MODELS.get(name, self.device))
-        key = (name, dev)
-        if key not in self._compiled:
-            xml = self.model_path(name)
-            if not os.path.exists(xml):
-                raise FileNotFoundError("NPU 模型缺失: %s" % xml)
-            self._compiled[key] = self.core.compile_model(xml, dev)
-        return self._compiled[key]
+        """懒加载 + 编译缓存。
+        每模型按降级链尝试：首选 self.device，编译失败自动退到 GPU → CPU。
+        """
+        xml = self.model_path(name)
+        if not os.path.exists(xml):
+            raise FileNotFoundError("NPU 模型缺失: %s" % xml)
+        # 尝试设备列表：显式指定 > 主设备 > GPU > CPU
+        candidates = []
+        if device:
+            candidates.append(device)
+        candidates.append(self.device)
+        for d in self.DEVICE_PRIORITY:
+            if d not in candidates:
+                candidates.append(d)
+        last_err = None
+        for dev in candidates:
+            key = (name, dev)
+            if key in self._compiled:
+                return self._compiled[key]
+            try:
+                self._compiled[key] = self.core.compile_model(xml, dev)
+                print("[BSAI-NPU-Service] model %s compiled on %s" % (name, dev))
+                return self._compiled[key]
+            except Exception as e:
+                last_err = e
+                print("[BSAI-NPU-Service] model %s failed on %s: %s" % (name, dev, e))
+                continue
+        raise RuntimeError("model %s failed on all devices: %s" % (name, last_err))
 
     def status(self):
         dev = self.device
@@ -115,11 +163,38 @@ class NPUService:
                 dev = self.core.get_property(self.device, "FULL_DEVICE_NAME")
             except Exception:
                 pass
+        with self._inflight_lock:
+            inflight = self._inflight
+            total = self._total_calls
+        # ready = 核心人脸检测模型已完成编译（首次推理后为 True）
+        ready = ("face-detect-10g", self.device) in self._compiled
         return {
-            "status": "online",
+            "status": "online" if self._core is not None else "degraded",
+            "ready": bool(ready),
+            "core": "ok" if Core is not None else "missing",
             "device": self.device,
             "device_name": dev,
             "npu_models": [m for m in NPU_MODELS if os.path.isdir(os.path.join(self.models_root, m))],
+            "inflight": inflight,
+            "queue_depth": inflight,
+            "total_calls": total,
+            "ts": time.time(),
+        }
+
+    def ready(self):
+        """就绪探针：推理通道可用 + 核心检测模型文件在位（可立即分发）"""
+        st = self.status()
+        try:
+            self.core  # 确保推理通道可建（Core 可用 / 设备可枚举）
+            xml = self.model_path("face-detect-10g")
+            ok = os.path.exists(xml)
+        except Exception:
+            ok = False
+        return {
+            "ready": bool(ok),
+            "status": st["status"],
+            "device": st["device"],
+            "compiled_models": list(self._compiled.keys()),
             "ts": time.time(),
         }
 
@@ -180,6 +255,16 @@ class NPUService:
 
     def detect_faces(self, img_bgr):
         """输入 BGR HxWx3 uint8（640 内任意尺寸，内部缩放），返回检测结果列表"""
+        with self._inflight_lock:
+            self._inflight += 1
+            self._total_calls += 1
+        try:
+            return self._detect_faces_impl(img_bgr)
+        finally:
+            with self._inflight_lock:
+                self._inflight -= 1
+
+    def _detect_faces_impl(self, img_bgr):
         compiled = self.get_compiled("face-detect-10g")
         h0, w0 = img_bgr.shape[:2]
         scale = DETECT_INPUT / max(h0, w0)
@@ -362,6 +447,9 @@ def main():
     async def health(_):
         return web.json_response(svc.status())
 
+    async def health_ready(_):
+        return web.json_response(svc.ready())
+
     async def detect_face(req):
         try:
             body = await req.json()
@@ -373,6 +461,7 @@ def main():
 
     app = web.Application()
     app.router.add_get("/health", health)
+    app.router.add_get("/health/ready", health_ready)
     app.router.add_post("/detect_face", detect_face)
     web.run_app(app, host=args.host, port=args.port)
     print("[BSAI-NPU-Service] listening on %s:%d device=%s" % (args.host, args.port, svc.device))

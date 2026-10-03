@@ -23,6 +23,32 @@ from aiohttp import web
 
 from .npu_service import NPUService, decode_image_bgr
 
+# ---- BSAI 插件协同 SDK：作为 NPU 人脸检测服务提供方注册能力（失败不拖垮插件） ----
+_ORCH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                     "..", "BSAI-ComfyUI-Orchestrator")
+if not os.path.isdir(_ORCH):
+    _ORCH = r"G:\BSAI-ComfyUI-intel-XPU-GPU-NPU-aki\ComfyUI\custom_nodes\BSAI-ComfyUI-Orchestrator"
+if os.path.isdir(_ORCH) and _ORCH not in sys.path:
+    sys.path.insert(0, _ORCH)
+try:
+    from bsai_orch_client import BSAIOrch
+except Exception:
+    BSAIOrch = None
+
+try:
+    if BSAIOrch is not None:
+        BSAIOrch.register(
+            name="BSAI-NPU-Service",
+            kind="face_detect",                 # 本服务即 NPU 人脸检测能力提供方
+            hardware=["npu"],
+            endpoint="http://127.0.0.1:8191/detect_face",
+            health="http://127.0.0.1:8191/health/ready",
+        )
+except Exception:
+    pass
+# 注：本插件是 NPU 推理执行体（OpenVINO 编译模型自管并发），不做消费侧
+# allocate；跨进程 NPU 互斥由消费方（FaceRefine 等）在检测时持租约。
+
 WEB_DIRECTORY = "./web" if os.path.isdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")) else None
 
 NODE_CLASS_MAPPINGS = {}
@@ -75,6 +101,10 @@ threading.Thread(target=_warmup, daemon=True).start()
 # ---------------- 路由处理 ----------------
 async def npu_health(_):
     return web.json_response(_svc.status())
+
+
+async def npu_health_ready(_):
+    return web.json_response(_svc.ready())
 
 
 async def npu_detect_face(req):
@@ -133,6 +163,7 @@ try:
         routes = _ps.routes
         for method, path, handler in [
             ("GET", "/health", npu_health),
+            ("GET", "/health/ready", npu_health_ready),
             ("POST", "/detect_face", npu_detect_face),
             ("POST", "/landmark_106", npu_landmark),
             ("POST", "/recog_r50", npu_recog),

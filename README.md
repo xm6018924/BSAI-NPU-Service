@@ -12,10 +12,10 @@ Intel AI Boost (NPU) face inference service for ComfyUI. Offloads face detection
 
 - **Face Detection** — SCRFD-based 640×640 detector with NMS, tuned for video faces (threshold 0.35)
 - **106-point Landmark** — Facial keypoint detection for face alignment
-- **Face Recognition** — 512-dim R50 embedding vector (runs on CPU due to NPU operator issues)
+- **Face Recognition** — 512-dim R50 embedding vector (auto-falls back GPU/CPU if NPU fails)
 - **Gender & Age** — Single-inference gender classification and age estimation
-- **Zero GPU overhead** — All inference runs on Intel NPU via OpenVINO
-- **Auto-fallback** — Gracefully degrades to CPU when NPU is unavailable
+- **Zero GPU overhead** — All inference runs on Intel NPU via OpenVINO, no NVIDIA VRAM used
+- **Three-tier fallback** — NPU → GPU (Intel iGPU/XPU) → CPU; each model compiles on first available device
 - **Dual mode** — ComfyUI plugin (mounts on :8191) or standalone HTTP service (:8192)
 
 ### Requirements
@@ -151,10 +151,10 @@ Intel AI Boost（NPU）人脸推理服务，作为 ComfyUI 插件运行。将人
 
 - **人脸检测** — 基于 SCRFD 的 640×640 检测器，带 NMS，针对视频人脸调优（阈值 0.35）
 - **106 点关键点** — 人脸对齐关键点检测
-- **人脸识别** — 512 维 R50 特征向量（因 NPU 算子问题强制走 CPU）
+- **人脸识别** — 512 维 R50 特征向量（NPU 编译失败自动降级 GPU/CPU）
 - **性别年龄** — 单次推理输出性别分类和年龄估计
-- **零 GPU 开销** — 所有推理通过 OpenVINO 在 Intel NPU 上运行
-- **自动降级** — 无 NPU 时自动切换 CPU，服务不中断
+- **零 GPU 开销** — 所有推理通过 OpenVINO 在 Intel NPU 上运行，不占 NVIDIA 显存
+- **三级降级链** — NPU → GPU（Intel 核显/XPU）→ CPU；每个模型在首个可用设备上编译
 - **双模式** — ComfyUI 插件（挂载 :8191）或独立 HTTP 服务（:8192）
 
 ### 环境要求
