@@ -228,6 +228,70 @@ class _NPUClient:
         b64 = _encode_image_b64(image_bgr)
         return _http_post("/gender_age", {"image": b64, "bbox": list(bbox)})
 
+    # ---- YOLO11n-pose 人体姿态（NPU） ----
+    def detect_pose(self, image_bgr):
+        """输入 BGR 图，返回 [{score, bbox, keypoints:[[x,y,c]*17], person}]"""
+        if not _ensure_service():
+            return []
+        if _direct and _svc is not None:
+            return _svc.detect_pose(image_bgr)
+        b64 = _encode_image_b64(image_bgr)
+        return _http_post("/detect_pose", {"image": b64}).get("poses", [])
+
+    # ---- NPU LLM 决策文本生成（Qwen3-4B 对称 INT4） ----
+    def llm_generate(self, prompt, max_new_tokens=128, temperature=0.7, top_p=0.9,
+                     enable_thinking=False, seed=None):
+        """NPU 文本生成，返回 {text, tokens, secs, device, model}"""
+        if not _ensure_service():
+            return {"text": "", "error": "NPU service offline"}
+        if _direct and _svc is not None:
+            return _svc.llm_generate(prompt, max_new_tokens=max_new_tokens,
+                                     temperature=temperature, top_p=top_p,
+                                     enable_thinking=enable_thinking, seed=seed)
+        r = _http_post("/llm_generate", {
+            "prompt": prompt, "max_new_tokens": int(max_new_tokens),
+            "temperature": float(temperature), "top_p": float(top_p),
+            "enable_thinking": bool(enable_thinking), "seed": seed,
+        })
+        return r.get("result", {"text": r.get("error", "")})
+
+    # ---- RMBG-1.4 前景抠图（NPU） ----
+    def segment_foreground(self, image_bgr):
+        """输入 BGR 图，返回 (前景 BGR 图, alpha HxW float32 0-1)"""
+        if not _ensure_service():
+            h, w = image_bgr.shape[:2]
+            return image_bgr, np.zeros((h, w), dtype=np.float32)
+        if _direct and _svc is not None:
+            return _svc.segment_foreground(image_bgr)
+        b64 = _encode_image_b64(image_bgr)
+        r = _http_post("/segment_foreground", {"image": b64})
+        fg_b64 = r.get("fg", "")
+        alpha_b64 = r.get("alpha", "")
+        fg = _decode_image_bgr_b64(fg_b64)
+        try:
+            alpha = np.frombuffer(base64.b64decode(alpha_b64), np.uint8)
+            import cv2 as _cv2
+            alpha = _cv2.imdecode(alpha, _cv2.IMREAD_GRAYSCALE).astype(np.float32) / 255.0
+        except Exception:
+            alpha = np.zeros((fg.shape[0], fg.shape[1]), dtype=np.float32)
+        return fg, alpha
+
+    # ---- Depth-Anything-V2-Small 深度估计（NPU） ----
+    def detect_depth(self, image_bgr):
+        """输入 BGR 图，返回 (depth 灰度图 HxW uint8 0-255, meta dict)"""
+        if not _ensure_service():
+            h, w = image_bgr.shape[:2]
+            return np.zeros((h, w), dtype=np.uint8), {"error": "NPU service offline"}
+        if _direct and _svc is not None:
+            return _svc.detect_depth(image_bgr)
+        b64 = _encode_image_b64(image_bgr)
+        r = _http_post("/detect_depth", {"image": b64})
+        depth_b64 = r.get("depth", "")
+        gray = _decode_image_bgr_b64(depth_b64)
+        if gray.ndim == 3:
+            gray = gray[:, :, 0]
+        return gray, r.get("meta", {})
+
     # ---- 便捷：检测+关键点+性别年龄一条龙 ----
     def analyze(self, image_bgr):
         """一次性检测人脸并返回完整信息列表：
@@ -276,6 +340,24 @@ def _encode_image_b64(image_bgr):
     buf = io.BytesIO()
     pil.save(buf, format="JPEG", quality=90)
     return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def _decode_image_bgr_b64(data):
+    """base64 jpeg -> BGR numpy"""
+    try:
+        import cv2 as _cv2
+        raw = np.frombuffer(base64.b64decode(data), np.uint8)
+        img = _cv2.imdecode(raw, _cv2.IMREAD_COLOR)
+        if img is not None:
+            return img
+    except Exception:
+        pass
+    from PIL import Image
+    import io
+    pil = Image.open(io.BytesIO(base64.b64decode(data)))
+    if pil.mode != "RGB":
+        pil = pil.convert("RGB")
+    return np.asarray(pil)[:, :, ::-1]
 
 
 # ---------------------------------------------------------------------------

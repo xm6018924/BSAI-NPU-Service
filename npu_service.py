@@ -30,6 +30,7 @@ except Exception:
     Core = None
 
 MODELS_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "models", "NPU")
+LLM_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "models", "LLM")
 
 # 可用模型清单（目录名 -> 说明），/health 的 npu_models 列表来源
 NPU_MODELS = [
@@ -39,9 +40,20 @@ NPU_MODELS = [
     "face-3d-68",
     "face-recog-r50",
     "gender-age",
+    "rmbg-1.4",
+    "yolo11-pose",
+    "depthanything-v2-small",
     "denoise-x1",
     "enhance-x1",
 ]
+
+# NPU 兼容对称 INT4 的 Qwen3-4B（optimum --sym --group-size -1 --ratio 1.0 导出）
+LLM_NPU_IR = os.path.join(LLM_ROOT, "Qwen3-4B-NPU-SYM-IR")
+
+try:
+    import openvino_genai as _ov_genai
+except Exception:
+    _ov_genai = None
 
 DETECT_INPUT = 640   # SCRFD 输入边长
 DETECT_STRIDES = (8, 16, 32)
@@ -92,6 +104,9 @@ class NPUService:
         self._inflight = 0        # 当前在途推理数（队列深度）
         self._total_calls = 0     # 累计推理调用数
         self._inflight_lock = threading.Lock()
+        self._llm_pipe = None     # openvino_genai.LLMPipeline 单例（NPU LLM）
+        self._llm_lock = threading.Lock()
+        self._llm_total_calls = 0
 
     # ---------------- 基础设施 ----------------
     @property
@@ -392,6 +407,226 @@ class NPUService:
         gender = "female" if vals[0] < 0 else "male"
         return {"gender": gender, "age": int(abs(vals[1]) * 100)}
 
+    # ---------------- NPU LLM（Qwen3-4B 对称 INT4，决策文本生成） ----------------
+    def get_llm_pipe(self):
+        """懒加载 openvino_genai LLMPipeline（NPU 编译一次约 40s，缓存单例）"""
+        if self._llm_pipe is not None:
+            return self._llm_pipe
+        with self._llm_lock:
+            if self._llm_pipe is not None:
+                return self._llm_pipe
+            if _ov_genai is None:
+                raise RuntimeError("openvino-genai 未安装: pip install openvino-genai openvino-tokenizers")
+            xml = os.path.join(LLM_NPU_IR, "openvino_model.xml")
+            if not os.path.exists(xml):
+                raise FileNotFoundError("NPU LLM IR 缺失: %s（需 optimum 导出 --sym --group-size -1 --ratio 1.0）" % xml)
+            t0 = time.time()
+            self._llm_pipe = _ov_genai.LLMPipeline(LLM_NPU_IR, self.device)
+            print("[BSAI-NPU-Service] LLM %s compiled on %s %.1fs" %
+                  (os.path.basename(LLM_NPU_IR), self.device, time.time() - t0))
+            return self._llm_pipe
+
+    def llm_generate(self, prompt, max_new_tokens=128, temperature=0.7, top_p=0.9,
+                     enable_thinking=False, seed=None):
+        """NPU 文本生成。返回 {text, tokens, secs, device}。
+        enable_thinking=False（默认）：system 指令压制思考 + 剥离思考残片，直接给答案；
+        enable_thinking=True：允许模型自由思考。"""
+        import re
+        t0 = time.time()
+        pipe = self.get_llm_pipe()
+        cfg = _ov_genai.GenerationConfig(
+            max_new_tokens=int(max_new_tokens),
+            temperature=float(temperature),
+            top_p=float(top_p),
+        )
+        if seed is not None:
+            cfg.rng_seed = int(seed)
+        with self._llm_lock:
+            self._llm_total_calls += 1
+            try:
+                if bool(enable_thinking):
+                    text = pipe.generate(prompt, cfg)
+                else:
+                    hist = _ov_genai.ChatHistory([
+                        {"role": "system",
+                         "content": "You must answer directly. Do NOT output any thinking process or reasoning. "
+                                    "Give the answer immediately, without <think> blocks."},
+                        {"role": "user", "content": prompt},
+                    ])
+                    text = pipe.generate(hist, cfg)
+            except Exception:
+                text = pipe.generate(prompt, cfg)
+        text = str(text)
+        if not bool(enable_thinking):
+            # 剥离思考块（含模板注入的空块与模型自写残片）
+            text = re.sub(r'<think>.*?</think>', '', text, flags=re.S)
+            text = text.replace("</think>", "").replace("<think>", "")
+        text = text.strip()
+        return {
+            "text": text,
+            "tokens": int(max_new_tokens),
+            "secs": round(time.time() - t0, 3),
+            "device": self.device,
+            "model": os.path.basename(LLM_NPU_IR),
+        }
+
+    # ---------------- YOLO11n-pose 人体姿态（NPU） ----------------
+    YOLO_INPUT = 640
+    YOLO_NUM_KPTS = 17
+    YOLO_SCORE_THRESH = 0.25
+    YOLO_NMS_THRESH = 0.45
+
+    def detect_pose(self, img_bgr):
+        """YOLO11n-pose 人体检测+17 关键点。输入 BGR HxWx3 uint8 ->
+        [{score, bbox:[x1,y1,x2,y2], keypoints:[[x,y,c]*17], person:bool}]"""
+        with self._inflight_lock:
+            self._inflight += 1
+            self._total_calls += 1
+        try:
+            compiled = self.get_compiled("yolo11-pose")
+            h0, w0 = img_bgr.shape[:2]
+            # letterbox 640（灰边 114，居中放置）
+            scale = min(self.YOLO_INPUT / h0, self.YOLO_INPUT / w0)
+            nh, nw = max(1, int(round(h0 * scale))), max(1, int(round(w0 * scale)))
+            y_off = (self.YOLO_INPUT - nh) // 2
+            x_off = (self.YOLO_INPUT - nw) // 2
+            canvas = np.full((self.YOLO_INPUT, self.YOLO_INPUT, 3), 114, dtype=np.uint8)
+            canvas[y_off:y_off + nh, x_off:x_off + nw] = np.asarray(ImageResize(img_bgr, nh, nw))
+            rgb = canvas[:, :, ::-1].astype(np.float32) / 255.0
+            blob = np.transpose(rgb, (2, 0, 1))[None]
+
+            outs = compiled([blob])
+            arr = np.asarray(outs[0])
+            if arr.ndim == 3:
+                arr = arr[0]
+            # YOLO11 输出 (56 特征, 8400 anchor)：特征在行、anchor 在列 -> 转置为 (anchor, 特征)
+            if arr.shape[0] == 56:
+                pred = arr.T
+            else:
+                pred = arr
+            # pred: (N, 56) -> box(4) + cls(1, person, 已 sigmoid) + kpt_x(17) + kpt_y(17) + kpt_c(17)
+            boxes_xywh = pred[:, 0:4]
+            conf = pred[:, 4]  # person 置信度（ONNX 输出已过 sigmoid，0-1）
+            kpt_x = pred[:, 5:5 + self.YOLO_NUM_KPTS]
+            kpt_y = pred[:, 5 + self.YOLO_NUM_KPTS:5 + 2 * self.YOLO_NUM_KPTS]
+            kpt_c = pred[:, 5 + 2 * self.YOLO_NUM_KPTS:5 + 3 * self.YOLO_NUM_KPTS]
+
+            keep = np.where(conf > self.YOLO_SCORE_THRESH)[0]
+            results = []
+            if len(keep):
+                bx = boxes_xywh[keep]
+                x1 = bx[:, 0] - bx[:, 2] / 2.0
+                y1 = bx[:, 1] - bx[:, 3] / 2.0
+                x2 = bx[:, 0] + bx[:, 2] / 2.0
+                y2 = bx[:, 1] + bx[:, 3] / 2.0
+                box = np.stack([x1, y1, x2, y2], axis=-1)
+                sc = conf[keep]
+                idx = self._nms(box, sc, self.YOLO_NMS_THRESH)
+                for i in idx:
+                    x1, y1, x2, y2 = box[i]
+                    # 640 坐标还原到原图（letterbox 逆变换）
+                    x1 = (x1 - x_off) / scale
+                    y1 = (y1 - y_off) / scale
+                    x2 = (x2 - x_off) / scale
+                    y2 = (y2 - y_off) / scale
+                    kpts = []
+                    for j in range(self.YOLO_NUM_KPTS):
+                        px = (kpt_x[keep][i, j] - x_off) / scale
+                        py = (kpt_y[keep][i, j] - y_off) / scale
+                        pc = float(kpt_c[keep][i, j])  # 可见性（已 sigmoid）
+                        kpts.append([round(float(px), 1), round(float(py), 1), round(float(pc), 4)])
+                    results.append({
+                        "score": round(float(sc[i]), 4),
+                        "bbox": [round(float(x1), 1), round(float(y1), 1),
+                                 round(float(x2), 1), round(float(y2), 1)],
+                        "keypoints": kpts,
+                        "person": bool(float(sc[i]) > 0.3),
+                    })
+            results.sort(key=lambda r: r["score"], reverse=True)
+            return results
+        finally:
+            with self._inflight_lock:
+                self._inflight -= 1
+
+    # ---------------- RMBG-1.4 抠图（NPU） ----------------
+    RMBG_INPUT = 1024
+    RMBG_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    RMBG_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+    def segment_foreground(self, img_bgr):
+        """RMBG-1.4 前景分割：输入 BGR HxWx3 uint8 → (前景 BGR 图, alpha HxW float32 0-1)"""
+        with self._inflight_lock:
+            self._inflight += 1
+            self._total_calls += 1
+        try:
+            compiled = self.get_compiled("rmbg-1.4")
+            h0, w0 = img_bgr.shape[:2]
+            # BiRefNet 前处理：resize 1024x1024（保持比例居中填充）+ RGB 0-1 + ImageNet 归一化
+            img = np.zeros((self.RMBG_INPUT, self.RMBG_INPUT, 3), dtype=np.float32)
+            scale = min(self.RMBG_INPUT / h0, self.RMBG_INPUT / w0)
+            nh, nw = max(1, int(round(h0 * scale))), max(1, int(round(w0 * scale)))
+            resized = np.asarray(ImageResize(img_bgr, nh, nw), dtype=np.float32) / 255.0
+            y0 = (self.RMBG_INPUT - nh) // 2
+            x0 = (self.RMBG_INPUT - nw) // 2
+            img[y0:y0 + nh, x0:x0 + nw] = resized
+            rgb = img[:, :, ::-1]
+            blob = ((rgb - self.RMBG_MEAN) / self.RMBG_STD).transpose(2, 0, 1)[None].astype(np.float32)
+
+            out = compiled([blob])
+            raw = np.asarray(out[0]).reshape(self.RMBG_INPUT, self.RMBG_INPUT)
+            # BiRefNet 输出已是 sigmoid 后的 0-1 前景概率（实测 p5≈0 / p95≈1）
+            alpha = np.clip(raw, 0.0, 1.0).astype(np.float32)
+            # 裁回原图比例 + 缩回原尺寸
+            alpha = alpha[y0:y0 + nh, x0:x0 + nw]
+            alpha = np.asarray(ImageResize((alpha * 255).astype(np.uint8), h0, w0), dtype=np.float32) / 255.0
+            fg = img_bgr.astype(np.float32) * alpha[:, :, None]
+            return np.clip(fg, 0, 255).astype(np.uint8), alpha
+        finally:
+            with self._inflight_lock:
+                self._inflight -= 1
+
+    # ---------------- Depth-Anything-V2-Small 深度估计（NPU） ----------------
+    DEPTH_INPUT = 518
+    DEPTH_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    DEPTH_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+    def detect_depth(self, img_bgr):
+        """Depth-Anything-V2-Small 单目深度：输入 BGR HxWx3 uint8 ->
+        (depth_map HxW uint8 0-255 灰度, meta{min,max,secs})"""
+        with self._inflight_lock:
+            self._inflight += 1
+            self._total_calls += 1
+        try:
+            t0 = time.time()
+            compiled = self.get_compiled("depthanything-v2-small")
+            h0, w0 = img_bgr.shape[:2]
+            # 前处理：等比缩放 518 + 黑边居中（与 HF DPTImageProcessor 对齐）
+            scale = min(self.DEPTH_INPUT / h0, self.DEPTH_INPUT / w0)
+            nh, nw = max(1, int(round(h0 * scale))), max(1, int(round(w0 * scale)))
+            canvas = np.zeros((self.DEPTH_INPUT, self.DEPTH_INPUT, 3), dtype=np.float32)
+            resized = np.asarray(ImageResize(img_bgr, nh, nw), dtype=np.float32) / 255.0
+            y0 = (self.DEPTH_INPUT - nh) // 2
+            x0 = (self.DEPTH_INPUT - nw) // 2
+            canvas[y0:y0 + nh, x0:x0 + nw] = resized
+            rgb = canvas[:, :, ::-1]
+            blob = ((rgb - self.DEPTH_MEAN) / self.DEPTH_STD).transpose(2, 0, 1)[None].astype(np.float32)
+
+            out = compiled([blob])
+            depth = np.asarray(out[0]).reshape(self.DEPTH_INPUT, self.DEPTH_INPUT).astype(np.float32)
+            # 裁回原比例
+            depth = depth[y0:y0 + nh, x0:x0 + nw]
+            dmin, dmax = float(depth.min()), float(depth.max())
+            # min-max 归一化到 0-255 灰度（DepthAnything 输出为相对深度）
+            span = (dmax - dmin) or 1.0
+            gray = np.clip((depth - dmin) / span * 255.0, 0, 255).astype(np.uint8)
+            # 缩回原图尺寸
+            gray = np.asarray(ImageResize(gray, h0, w0))
+            return gray, {"min": round(dmin, 4), "max": round(dmax, 4),
+                          "secs": round(time.time() - t0, 3)}
+        finally:
+            with self._inflight_lock:
+                self._inflight -= 1
+
 
 # ---------------- 图像缩放（避免依赖 cv2：PIL/numpy 双保险） ----------------
 def ImageResize(img, nh, nw):
@@ -436,7 +671,6 @@ def decode_image_bgr(data: bytes):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="BSAI NPU Service (Intel AI Boost)")
     ap.add_argument("--port", type=int, default=8192)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--device", default="NPU")
