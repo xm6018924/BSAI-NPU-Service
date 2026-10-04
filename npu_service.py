@@ -107,8 +107,70 @@ class NPUService:
         self._llm_pipe = None     # openvino_genai.LLMPipeline 单例（NPU LLM）
         self._llm_lock = threading.Lock()
         self._llm_total_calls = 0
+        # ---- 调用统计（供仪表盘展示真实 NPU 工作状态） ----
+        # Intel NPU 没有 nvidia-smi 那样的利用率读取接口，
+        # 用调用计数 + 延迟 + 最近活跃时间来反映真实工作状态。
+        self._stats_lock = threading.Lock()
+        self._model_calls = {}         # {model_name: call_count}
+        self._model_last_latency = {}  # {model_name: last_latency_ms}
+        self._last_call_ts = 0.0       # 最近一次调用时间戳
+        self._last_latency_ms = 0.0    # 最近一次推理延迟
+        self._window_calls = 0         # 最近 5 秒窗口内调用数（滑动）
+        self._window_start = 0.0       # 当前窗口起始时间
 
     # ---------------- 基础设施 ----------------
+    def _record_inference(self, model_name, latency_ms):
+        """记录一次推理调用的统计数据（线程安全）。"""
+        now = time.time()
+        with self._stats_lock:
+            self._model_calls[model_name] = self._model_calls.get(model_name, 0) + 1
+            self._model_last_latency[model_name] = latency_ms
+            self._last_call_ts = now
+            self._last_latency_ms = latency_ms
+            # 5 秒滑动窗口调用计数
+            if now - self._window_start >= 5.0:
+                self._window_start = now
+                self._window_calls = 1
+            else:
+                self._window_calls += 1
+
+    def get_stats(self):
+        """获取 NPU 运行统计（供仪表盘展示）。
+
+        Returns:
+            dict: {
+                total_calls, model_calls, last_call_ts, last_latency_ms,
+                inflight, window_calls_5s, active_now (最近10秒有调用),
+                avg_latency_ms_estimate, device
+            }
+        """
+        with self._stats_lock:
+            total = self._total_calls
+            mc = dict(self._model_calls)
+            mll = dict(self._model_last_latency)
+            last_ts = self._last_call_ts
+            last_lat = self._last_latency_ms
+            wc = self._window_calls
+        with self._inflight_lock:
+            inflight = self._inflight
+        now = time.time()
+        active = (now - last_ts) < 10.0 if last_ts > 0 else False
+        # 估算平均延迟（最近一次各模型延迟的简单平均）
+        avg_lat = 0.0
+        if mll:
+            avg_lat = sum(mll.values()) / len(mll)
+        return {
+            "total_calls": total,
+            "model_calls": mc,
+            "last_call_ts": last_ts,
+            "last_latency_ms": round(last_lat, 1),
+            "inflight": inflight,
+            "window_calls_5s": wc,
+            "active_now": active,
+            "avg_latency_ms": round(avg_lat, 1),
+            "device": self.device,
+        }
+
     @property
     def core(self):
         if self._core is None:
@@ -273,9 +335,12 @@ class NPUService:
         with self._inflight_lock:
             self._inflight += 1
             self._total_calls += 1
+        t0 = time.perf_counter()
         try:
             return self._detect_faces_impl(img_bgr)
         finally:
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            self._record_inference("face-detect-10g", dt_ms)
             with self._inflight_lock:
                 self._inflight -= 1
 
