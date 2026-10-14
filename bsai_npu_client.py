@@ -240,20 +240,60 @@ class _NPUClient:
 
     # ---- NPU LLM 决策文本生成（Qwen3-4B 对称 INT4） ----
     def llm_generate(self, prompt, max_new_tokens=128, temperature=0.7, top_p=0.9,
-                     enable_thinking=False, seed=None):
-        """NPU 文本生成，返回 {text, tokens, secs, device, model}"""
+                     enable_thinking=False, seed=None, backend="npu"):
+        """文本生成，返回 {text, tokens, secs, device, model}。
+        backend: "npu" (default) 或 "strata" (本地 Qwen3.8-Flash-Next)。"""
         if not _ensure_service():
+            # Fallback: 即使 NPU service offline，strata 后端也直接 HTTP
+            if str(backend).lower().startswith("strata"):
+                return _bsai_strata_http(prompt, max_new_tokens, temperature, top_p, enable_thinking)
             return {"text": "", "error": "NPU service offline"}
         if _direct and _svc is not None:
             return _svc.llm_generate(prompt, max_new_tokens=max_new_tokens,
                                      temperature=temperature, top_p=top_p,
-                                     enable_thinking=enable_thinking, seed=seed)
+                                     enable_thinking=enable_thinking, seed=seed,
+                                     backend=backend)
         r = _http_post("/llm_generate", {
             "prompt": prompt, "max_new_tokens": int(max_new_tokens),
             "temperature": float(temperature), "top_p": float(top_p),
             "enable_thinking": bool(enable_thinking), "seed": seed,
+            "backend": backend,
         })
         return r.get("result", {"text": r.get("error", "")})
+
+
+def _bsai_strata_http(prompt, max_new_tokens, temperature, top_p, enable_thinking):
+    import json as _json, time as _time, re as _re
+    import socket as _sk, http.client as _hc
+    from urllib.parse import urlparse as _up
+    t0 = _time.time()
+    msgs = []
+    if not bool(enable_thinking):
+        msgs.append({"role": "system",
+                     "content": "You must answer directly. Do NOT output any thinking process."})
+    msgs.append({"role": "user", "content": prompt})
+    payload = {"model": "qwen3.8-flash-next", "messages": msgs,
+               "max_tokens": int(max_new_tokens), "temperature": float(temperature),
+               "top_p": float(top_p), "stream": False}
+    body = _json.dumps(payload).encode("utf-8")
+    # Blocking socket to avoid WinError 10035 under Python 3.14 asyncio
+    s = _sk.socket(_sk.AF_INET, _sk.SOCK_STREAM)
+    s.settimeout(600); s.setblocking(True)
+    s.connect(("127.0.0.1", 8080))
+    try:
+        conn = _hc.HTTPConnection("127.0.0.1", 8080, timeout=600)
+        conn.sock = s
+        conn.request("POST", "/v1/chat/completions", body=body,
+                     headers={"Content-Type": "application/json", "Authorization": "Bearer strata"})
+        out = _json.loads(conn.getresponse().read().decode("utf-8", "replace"))
+    finally:
+        s.close()
+    text = out["choices"][0]["message"]["content"]
+    if not bool(enable_thinking):
+        text = _re.sub(r'<think>.*?</think>', '', text, flags=_re.S)
+    return {"text": text.strip(), "tokens": int(max_new_tokens),
+            "secs": round(_time.time() - t0, 3),
+            "device": "strata-http", "model": "qwen3.8-flash-next"}
 
     # ---- RMBG-1.4 前景抠图（NPU） ----
     def segment_foreground(self, image_bgr):
