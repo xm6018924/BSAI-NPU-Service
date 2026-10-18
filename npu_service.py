@@ -67,7 +67,7 @@ DETECT_NMS_KEEP = 100
 
 def _core():
     if Core is None:
-        raise RuntimeError("openvino 未安装: pip install openvino")
+        raise RuntimeError("openvino is not installed: pip install openvino")
     return Core()
 
 
@@ -209,7 +209,7 @@ class NPUService:
         """
         xml = self.model_path(name)
         if not os.path.exists(xml):
-            raise FileNotFoundError("NPU 模型缺失: %s" % xml)
+            raise FileNotFoundError("NPU model missing: %s" % xml)
         # 尝试设备列表：显式指定 > 主设备 > GPU > CPU
         candidates = []
         if device:
@@ -481,10 +481,10 @@ class NPUService:
             if self._llm_pipe is not None:
                 return self._llm_pipe
             if _ov_genai is None:
-                raise RuntimeError("openvino-genai 未安装: pip install openvino-genai openvino-tokenizers")
+                raise RuntimeError("openvino-genai is not installed: pip install openvino-genai openvino-tokenizers")
             xml = os.path.join(LLM_NPU_IR, "openvino_model.xml")
             if not os.path.exists(xml):
-                raise FileNotFoundError("NPU LLM IR 缺失: %s（需 optimum 导出 --sym --group-size -1 --ratio 1.0）" % xml)
+                raise FileNotFoundError("NPU LLM IR missing: %s (export with optimum --sym --group-size -1 --ratio 1.0)" % xml)
             t0 = time.time()
             self._llm_pipe = _ov_genai.LLMPipeline(LLM_NPU_IR, self.device)
             print("[BSAI-NPU-Service] LLM %s compiled on %s %.1fs" %

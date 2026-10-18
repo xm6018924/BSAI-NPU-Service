@@ -79,7 +79,7 @@ def _inject_client():
         mod._svc = _svc
         mod._direct = True
     except Exception as e:
-        print("[BSAI-NPU-Service] 客户端注入跳过: %s" % e)
+        print("[BSAI-NPU-Service] Client injection skipped: %s" % e)
 
 
 _inject_client()
@@ -91,9 +91,9 @@ def _warmup():
         import numpy as np
         dummy = np.zeros((64, 64, 3), dtype=np.uint8)
         _svc.detect_faces(dummy)
-        print("[BSAI-NPU-Service] NPU 模型预热完成 (device=%s)" % _svc.device)
+        print("[BSAI-NPU-Service] NPU model warmup done (device=%s)" % _svc.device)
     except Exception as e:
-        print("[BSAI-NPU-Service] NPU 预热跳过: %s" % e)
+        print("[BSAI-NPU-Service] NPU warmup skipped: %s" % e)
 
 
 threading.Thread(target=_warmup, daemon=True).start()
@@ -272,13 +272,13 @@ def _register_routes():
                         routes.add_route(method, path, handler)
                     except Exception:
                         pass
-            print("[BSAI-NPU-Service] NPU 服务已挂载到 ComfyUI: GET /health POST /detect_face /landmark_106 /recog_r50 /gender_age /llm_generate /segment_foreground /detect_pose (device=%s)" % _svc.device)
+            print("[BSAI-NPU-Service] NPU service mounted to ComfyUI: GET /health POST /detect_face /landmark_106 /recog_r50 /gender_age /llm_generate /segment_foreground /detect_pose (device=%s)" % _svc.device)
             return True
         else:
-            print("[BSAI-NPU-Service] PromptServer.instance 未就绪，路由将在节点定义处补注册")
+            print("[BSAI-NPU-Service] PromptServer.instance not ready; routes will be re-registered at node definition")
             return False
     except Exception as e:
-        print("[BSAI-NPU-Service] 路由注册容错跳过:", e)
+        print("[BSAI-NPU-Service] Route registration fallback skipped:", e)
         return False
 
 
@@ -309,7 +309,7 @@ class BSAINPU_LLMGenerate:
         return {
             "required": {
                 "prompt": ("STRING", {"multiline": True,
-                                      "default": "请用不超过 30 字总结画面内容，并给出下一步处理建议。"}),
+                                      "default": "Summarize the scene in no more than 30 words and suggest the next processing step."}),
                 "max_new_tokens": ("INT", {"default": 128, "min": 8, "max": 1024, "step": 8}),
                 "temperature": ("FLOAT", {"default": 0.7, "min": 0.1, "max": 2.0, "step": 0.05}),
                 "top_p": ("FLOAT", {"default": 0.9, "min": 0.1, "max": 1.0, "step": 0.05}),
@@ -331,7 +331,7 @@ class BSAINPU_LLMGenerate:
                                  enable_thinking=enable_thinking)
             return (r.get("text", ""), json.dumps(r, ensure_ascii=False))
         except Exception as e:
-            return ("[NPU LLM 错误] %s" % e, json.dumps({"error": str(e)}, ensure_ascii=False))
+            return ("[NPU LLM Error] %s" % e, json.dumps({"error": str(e)}, ensure_ascii=False))
 
 
 class BSAINPU_SegmentForeground:
@@ -419,10 +419,10 @@ NODE_CLASS_MAPPINGS = {
     "BSAINPU_DepthEstimate": BSAINPU_DepthEstimate,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "BSAINPU_LLMGenerate": "BSAI NPU LLM 决策文本",
-    "BSAINPU_SegmentForeground": "BSAI NPU 前景抠图 (RMBG)",
-    "BSAINPU_PoseDetect": "BSAI NPU 人体姿态 (YOLO11)",
-    "BSAINPU_DepthEstimate": "BSAI NPU 深度估计 (DepthAnything)",
+    "BSAINPU_LLMGenerate": "BSAI NPU LLM Decision Text",
+    "BSAINPU_SegmentForeground": "BSAI NPU Foreground Matting (RMBG)",
+    "BSAINPU_PoseDetect": "BSAI NPU Pose Detection (YOLO11)",
+    "BSAINPU_DepthEstimate": "BSAI NPU Depth Estimation (DepthAnything)",
 }
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
