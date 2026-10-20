@@ -242,11 +242,15 @@ class _NPUClient:
     def llm_generate(self, prompt, max_new_tokens=128, temperature=0.7, top_p=0.9,
                      enable_thinking=False, seed=None, backend="npu"):
         """文本生成，返回 {text, tokens, secs, device, model}。
-        backend: "npu" (default) 或 "strata" (本地 Qwen3.8-Flash-Next)。"""
+        backend: "npu" (default)、"strata" (本地 Qwen3.8-Flash-Next) 或 "ninfer" (本地 AI蛮子 ninfer 引擎)。"""
         if not _ensure_service():
-            # Fallback: 即使 NPU service offline，strata 后端也直接 HTTP
+            # Fallback: 即使 NPU service offline，strata/nemotron/ninfer 后端也直接 HTTP
             if str(backend).lower().startswith("strata"):
                 return _bsai_strata_http(prompt, max_new_tokens, temperature, top_p, enable_thinking)
+            if str(backend).lower().startswith("nemotron"):
+                return _bsai_nemotron_http(prompt, max_new_tokens, temperature, top_p, enable_thinking)
+            if str(backend).lower().startswith("ninfer"):
+                return _bsai_ninfer_http(prompt, max_new_tokens, temperature, top_p, enable_thinking)
             return {"text": "", "error": "NPU service offline"}
         if _direct and _svc is not None:
             return _svc.llm_generate(prompt, max_new_tokens=max_new_tokens,
@@ -294,6 +298,101 @@ def _bsai_strata_http(prompt, max_new_tokens, temperature, top_p, enable_thinkin
     return {"text": text.strip(), "tokens": int(max_new_tokens),
             "secs": round(_time.time() - t0, 3),
             "device": "strata-http", "model": "qwen3.8-flash-next"}
+
+
+def _bsai_nemotron_http(prompt, max_new_tokens, temperature, top_p, enable_thinking):
+    """OpenAI-compatible call to the local Nemotron 3.5 Bolt (llama.cpp),
+    auto-started via NemotronManager on 127.0.0.1:8085."""
+    import json as _json, time as _time, re as _re
+    import os as _os
+    import importlib.util as _ilu
+    t0 = _time.time()
+    msgs = []
+    if not bool(enable_thinking):
+        msgs.append({"role": "system",
+                     "content": "You must answer directly. Do NOT output any thinking process."})
+    msgs.append({"role": "user", "content": prompt})
+
+    _p = _os.path.join(_os.path.dirname(__file__), "..", "BSAI-LLM-Strata", "strata_manager.py")
+    if not _os.path.exists(_p):
+        return {"text": "", "error": "BSAI-LLM-Strata 插件缺失，无法启动 Nemotron"}
+    _spec = _ilu.spec_from_file_location("bsai_strata_manager", _p)
+    _m = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_m)
+    _mp = _os.environ.get("BSAI_NEMOTRON_MODEL", "") or None
+    ok, msg = _m.NemotronManager.ensure_running(model_path=_mp)
+    if not ok:
+        return {"text": "", "error": f"Nemotron 启动失败: {msg}"}
+
+    payload = {"model": "Nemotron-3.5-Bolt-74B-A9B", "messages": msgs,
+               "max_tokens": int(max_new_tokens), "temperature": float(temperature),
+               "top_p": float(top_p), "stream": False}
+    mids = _m.NemotronManager.models()
+    if mids:
+        payload["model"] = mids[0]
+    body = _json.dumps(payload).encode("utf-8")
+    r = _m.NemotronManager.chat(msgs, model=payload["model"],
+                                max_tokens=int(max_new_tokens),
+                                temperature=float(temperature))
+    text = r["choices"][0]["message"]["content"]
+    if not bool(enable_thinking):
+        text = _re.sub(r'<think>.*?</think>', '', text, flags=_re.S)
+    return {"text": text.strip(), "tokens": int(max_new_tokens),
+            "secs": round(_time.time() - t0, 3),
+            "device": "nemotron-http", "model": payload["model"]}
+
+
+def _bsai_ninfer_http(prompt, max_new_tokens, temperature, top_p, enable_thinking):
+    """OpenAI-compatible call to the local NInfer engine (AI蛮子 ninfer),
+    auto-started via NInferManager on a dynamic free port."""
+    import json as _json, time as _time, re as _re
+    import socket as _sk, http.client as _hc
+    from urllib.parse import urlparse as _up
+    import os as _os
+    import importlib.util as _ilu
+    t0 = _time.time()
+    msgs = []
+    if not bool(enable_thinking):
+        msgs.append({"role": "system",
+                     "content": "You must answer directly. Do NOT output any thinking process."})
+    msgs.append({"role": "user", "content": prompt})
+
+    _p = _os.path.join(_os.path.dirname(__file__), "..", "BSAI-LLM-Strata", "strata_manager.py")
+    if not _os.path.exists(_p):
+        return {"text": "", "error": "BSAI-LLM-Strata 插件缺失，无法启动 ninfer"}
+    _spec = _ilu.spec_from_file_location("bsai_strata_manager", _p)
+    _m = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_m)
+    _mp = _os.environ.get("BSAI_NINFER_MODEL", "") or None
+    ok, msg = _m.NInferManager.ensure_running(model_path=_mp)
+    if not ok:
+        return {"text": "", "error": f"NInfer 启动失败: {msg}"}
+
+    payload = {"model": "default", "messages": msgs,
+               "max_tokens": int(max_new_tokens), "temperature": float(temperature),
+               "top_p": float(top_p), "stream": False}
+    mids = _m.NInferManager.models()
+    if mids:
+        payload["model"] = mids[0]
+    body = _json.dumps(payload).encode("utf-8")
+    u = _up(_m.NInferManager.base_url())
+    s = _sk.socket(_sk.AF_INET, _sk.SOCK_STREAM)
+    s.settimeout(600); s.setblocking(True)
+    s.connect((u.hostname, u.port or 80))
+    try:
+        conn = _hc.HTTPConnection(u.hostname, u.port or 80, timeout=600)
+        conn.sock = s
+        conn.request("POST", u.path + "/chat/completions", body=body,
+                     headers={"Content-Type": "application/json"})
+        out = _json.loads(conn.getresponse().read().decode("utf-8", "replace"))
+    finally:
+        s.close()
+    text = out["choices"][0]["message"]["content"]
+    if not bool(enable_thinking):
+        text = _re.sub(r'<think>.*?</think>', '', text, flags=_re.S)
+    return {"text": text.strip(), "tokens": int(max_new_tokens),
+            "secs": round(_time.time() - t0, 3),
+            "device": "ninfer-http", "model": payload["model"]}
 
     # ---- RMBG-1.4 前景抠图（NPU） ----
     def segment_foreground(self, image_bgr):

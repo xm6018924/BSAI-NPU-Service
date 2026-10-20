@@ -24,6 +24,38 @@ import numpy as np
 
 from .npu_service import NPUService, decode_image_bgr
 
+
+def _bsai_npu_ninfer_models():
+    """NInfer 模型下拉：models/LLM 下所有 *.ninfer 相对路径。"""
+    try:
+        import importlib.util as _ilu
+        _p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "..", "BSAI-LLM-Strata", "strata_manager.py")
+        if not os.path.exists(_p):
+            return []
+        _spec = _ilu.spec_from_file_location("bsai_strata_manager", _p)
+        _m = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_m)
+        return [rel for rel, _abs in _m.NInferManager.list_models()]
+    except Exception:
+        return []
+
+
+def _bsai_npu_nemotron_models():
+    """Nemotron 模型下拉：models/LLM/Nemotron 下所有非 mmproj 的 *.gguf。"""
+    try:
+        import importlib.util as _ilu
+        _p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "..", "BSAI-LLM-Strata", "strata_manager.py")
+        if not os.path.exists(_p):
+            return []
+        _spec = _ilu.spec_from_file_location("bsai_strata_manager", _p)
+        _m = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_m)
+        return [rel for rel, _abs, kind in _m.NemotronManager.list_models() if kind == "model"]
+    except Exception:
+        return []
+
 # ---- BSAI 插件协同 SDK：作为 NPU 人脸检测服务提供方注册能力（失败不拖垮插件） ----
 _ORCH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                      "..", "BSAI-ComfyUI-Orchestrator")
@@ -302,7 +334,7 @@ def _bgr_to_img(bgr):
 
 
 class BSAINPU_LLMGenerate:
-    """Qwen3-4B（NPU 对称 INT4）决策文本生成：把提示词/决策文本任务卸载到 NPU"""
+    """Qwen3-4B（NPU 对称 INT4）决策文本生成；也支持 Strata / NInfer 本地大模型后端"""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -310,10 +342,22 @@ class BSAINPU_LLMGenerate:
             "required": {
                 "prompt": ("STRING", {"multiline": True,
                                       "default": "Summarize the scene in no more than 30 words and suggest the next processing step."}),
+                # 注意：新增控件一律追加在 required 尾部。旧工作流 JSON 的 widgets_values
+                # 按位置映射，若插在中间会把旧值错位到新下拉框导致 "Value not in list"。
                 "max_new_tokens": ("INT", {"default": 128, "min": 8, "max": 1024, "step": 8}),
                 "temperature": ("FLOAT", {"default": 0.7, "min": 0.1, "max": 2.0, "step": 0.05}),
                 "top_p": ("FLOAT", {"default": 0.9, "min": 0.1, "max": 1.0, "step": 0.05}),
                 "enable_thinking": ("BOOLEAN", {"default": False}),
+                # 后 3 项为新增多后端控件：追加在尾部，兼容旧工作流 JSON 的按位置映射
+                "backend": (["NPU (local 4B INT4)", "BSAI Strata (Qwen3.8-Flash-Next @8080)", "BSAI Nemotron (llama.cpp @8085)", "BSAI NInfer (本地反推 @808x)"],
+                            {"default": "NPU (local 4B INT4)",
+                             "tooltip": "NPU runs the 4B Qwen locally; Strata/Nemotron/NInfer call the local HTTP engines (dynamic free port for NInfer)"}),
+                "ninfer_model": (["(Auto — first model found)"] + _bsai_npu_ninfer_models(),
+                            {"default": "(Auto — first model found)",
+                             "tooltip": "NInfer backend only: which *.ninfer model to load. Changing it restarts the NInfer engine."}),
+                "nemotron_model": (["(Auto — first model found)"] + _bsai_npu_nemotron_models(),
+                            {"default": "(Auto — first model found)",
+                             "tooltip": "Nemotron backend only: which GGUF model to load (models/LLM/Nemotron, excludes mmproj). Changing it restarts llama.cpp."}),
             }
         }
 
@@ -322,13 +366,27 @@ class BSAINPU_LLMGenerate:
     FUNCTION = "run"
     CATEGORY = "BSAI/NPU"
 
-    def run(self, prompt, max_new_tokens, temperature, top_p, enable_thinking):
+    # 新增三参带默认值：旧工作流 JSON 缺 key 时（如 API 直跑旧存档）按新默认值执行
+    def run(self, prompt, max_new_tokens, temperature, top_p, enable_thinking,
+            backend="NPU (local 4B INT4)", ninfer_model="(Auto — first model found)",
+            nemotron_model="(Auto — first model found)"):
         import json
         try:
             from bsai_npu_client import npu
+            b = "npu"
+            if str(backend).lower().startswith("bsai strata"):
+                b = "strata"
+            elif str(backend).lower().startswith("bsai nemotron"):
+                b = "nemotron"
+                if not str(nemotron_model).startswith("(Auto"):
+                    os.environ["BSAI_NEMOTRON_MODEL"] = str(nemotron_model)
+            elif str(backend).lower().startswith("bsai ninfer"):
+                b = "ninfer"
+                if not str(ninfer_model).startswith("(Auto"):
+                    os.environ["BSAI_NINFER_MODEL"] = str(ninfer_model)
             r = npu.llm_generate(prompt, max_new_tokens=max_new_tokens,
                                  temperature=temperature, top_p=top_p,
-                                 enable_thinking=enable_thinking)
+                                 enable_thinking=enable_thinking, backend=b)
             return (r.get("text", ""), json.dumps(r, ensure_ascii=False))
         except Exception as e:
             return ("[NPU LLM Error] %s" % e, json.dumps({"error": str(e)}, ensure_ascii=False))
